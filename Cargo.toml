@@ -12,7 +12,7 @@ resolver = "2"
 arpabet = "2.0.0"
 jieba-rs = "0.7.2"
 ndarray = "0.16.1"
-ort = "2.0.0-rc.9"
+ort = {version = "2.0.0-rc.9", features = ["ndarray","download-binaries","copy-dylibs", "half"]}
 pinyin = "0.10.0"
-rodio = { version = "0.20.1", default-features = false, features = ["cpal-shared-stdcxx", "mp3"] }
 log = "0.4.25"
+hound = "3.5.1"

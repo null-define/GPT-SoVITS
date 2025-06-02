@@ -1,33 +1,46 @@
+use hound::{WavReader, WavSpec, WavWriter};
+use ndarray::{s, Array, ArrayView, Axis, IntoDimension, IxDyn};
+use ort::{
+    execution_providers::CPUExecutionProvider,
+    session::Session,
+    value::{Tensor, TensorRef},
+};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    time::SystemTime,
+};
+
+// Module imports (assuming these are in separate files)
 mod conversion;
 mod detection;
 mod error;
 mod phoneme;
 mod symbol;
 
-use std::{
-    fs::File,
-    io::{Seek, SeekFrom},
-    path::Path,
-    time::SystemTime,
-};
-pub use {conversion::*, detection::*, error::*, phoneme::*, symbol::*};
-
-use ndarray::{s, Array, ArrayView, Axis, IntoDimension, IxDyn};
-use ort::{execution_providers::CUDAExecutionProvider, inputs, session::Session};
-use rodio::{
-    buffer::SamplesBuffer, source::UniformSourceIterator, Decoder, OutputStream, Sink, Source,
+pub use {
+    conversion::*,
+    detection::*,
+    error::GptSoVitsError, // Explicitly import the error type
+    phoneme::*,
+    symbol::*,
 };
 
 fn argmax(tensor: &ArrayView<f32, IxDyn>) -> (usize, usize) {
     let mut max_index = (0, 0);
-    let mut max_value = tensor.get(IxDyn::zeros(2));
+    let mut max_value = tensor
+        .get(IxDyn::zeros(2))
+        .copied()
+        .unwrap_or(f32::NEG_INFINITY);
 
     for i in 0..tensor.shape()[0] {
         for j in 0..tensor.shape()[1] {
-            let value = tensor.get((i, j).into_dimension());
-            if value > max_value {
-                max_value = value;
-                max_index = (i, j);
+            if let Some(value) = tensor.get((i, j).into_dimension()) {
+                if *value > max_value {
+                    max_value = *value;
+                    max_index = (i, j);
+                }
             }
         }
     }
@@ -45,144 +58,232 @@ pub fn run<P: AsRef<Path>>(
     t2s_fs_decoder_path: P,
     t2s_s_decoder_path: P,
     reference_audio_path: P,
+    ref_text: &str,
     text: &str,
 ) -> Result<(), GptSoVitsError> {
-    let sovits = Session::builder()?
-        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+    // Initialize ONNX sessions
+    let mut sovits = Session::builder()?
+        .with_execution_providers([CPUExecutionProvider::default().build()])?
         .commit_from_file(sovits_path)?;
-    let ssl = Session::builder()?
-        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+    let mut ssl = Session::builder()?
+        .with_execution_providers([CPUExecutionProvider::default().build()])?
         .commit_from_file(ssl_path)?;
-    let t2s_encoder = Session::builder()?
-        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+    let mut t2s_encoder = Session::builder()?
+        .with_execution_providers([CPUExecutionProvider::default().build()])?
         .commit_from_file(t2s_encoder_path)?;
-    let t2s_fs_decoder = Session::builder()?
-        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+    let mut t2s_fs_decoder = Session::builder()?
+        .with_execution_providers([CPUExecutionProvider::default().build()])?
         .commit_from_file(t2s_fs_decoder_path)?;
-    let t2s_s_decoder = Session::builder()?
-        .with_execution_providers([CUDAExecutionProvider::default().build()])?
+    let mut t2s_s_decoder = Session::builder()?
+        .with_execution_providers([CPUExecutionProvider::default().build()])?
         .commit_from_file(t2s_s_decoder_path)?;
 
+    // Text processing
     let mut extractor = PhonemeExtractor::default();
     extractor.push_str(text);
     let text_seq = extractor.get_phone_ids();
     println!("{:?}", extractor);
     let text_seq = Array::from_shape_vec((1, text_seq.len()), text_seq)?;
     let text_bert = Array::<f32, _>::zeros((text_seq.shape()[1], 1024));
-    let ref_seq = vec![
-        227i64, 167, 158, 119, 97, 1, 316, 232, 251, 169, 320, 169, 227, 146, 318, 257, 318, 196,
-        320, 258, 251, 242,
-    ];
+
+    extractor = PhonemeExtractor::default();
+    extractor.push_str(ref_text);
+    let ref_seq = extractor.get_phone_ids();
+    println!("{:?}", extractor); // Reference sequence
+
     let ref_seq = Array::from_shape_vec((1, ref_seq.len()), ref_seq)?;
     let ref_bert = Array::<f32, _>::zeros((ref_seq.shape()[1], 1024));
 
-    let mut file = File::open(reference_audio_path)?;
-    let ref_audio_16k = UniformSourceIterator::new(
-        Decoder::new(file.try_clone()?)?.convert_samples::<f32>(),
-        1,
-        16000,
-    )
-    .collect::<Vec<f32>>();
+    // Read and resample reference audio to 16kHz
+    let mut file = File::open(&reference_audio_path)?;
+    let wav_reader = WavReader::new(file)?;
+    let spec = wav_reader.spec();
+    let audio_samples: Vec<f32> = wav_reader
+        .into_samples::<i16>()
+        .collect::<Result<Vec<i16>, _>>()?
+        .into_iter()
+        .map(|s| s as f32 / i16::MAX as f32)
+        .collect();
+    let ref_audio_16k = if spec.sample_rate != 16000 {
+        resample_audio(audio_samples.clone(), spec.sample_rate, 16000)?
+    } else {
+        audio_samples.clone()
+    };
     let ref_audio_16k = Array::from_shape_vec((1, ref_audio_16k.len()), ref_audio_16k)?;
 
+    // SSL processing
     let time = SystemTime::now();
-    let ssl_output = ssl.run(inputs!["ref_audio_16k" => ref_audio_16k.view()]?)?;
+    let ssl_output = ssl.run(ort::inputs![
+        "ref_audio_16k" => Tensor::from_array(ref_audio_16k)?
+    ])?;
     println!("SSL Cost is {:?}", time.elapsed()?);
 
+    // T2S Encoder
     let time = SystemTime::now();
-    let encoder_output = t2s_encoder.run(inputs![
-        "ref_seq" => ref_seq.view(),
-        "text_seq" => text_seq.view(),
-        "ref_bert" => ref_bert,
-        "text_bert" => text_bert,
-        "ssl_content" => ssl_output["ssl_content"].try_extract_tensor::<f32>()?,
-    ]?)?;
+    let encoder_output = t2s_encoder.run(ort::inputs![
+        "ref_seq" => Tensor::from_array(ref_seq.to_owned())?,
+        "text_seq" => Tensor::from_array(text_seq.to_owned())?,
+        "ref_bert" => Tensor::from_array(ref_bert.to_owned())?,
+        "text_bert" => Tensor::from_array(text_bert.to_owned())?,
+        "ssl_content" => Tensor::from_array(ssl_output["ssl_content"].try_extract_array::<f32>()?.to_owned())?,
+    ])?;
     println!("T2S Encoder Cost is {:?}", time.elapsed()?);
-    let x = encoder_output["x"].try_extract_tensor::<f32>()?;
-    let prompts = encoder_output["prompts"].try_extract_tensor::<i64>()?;
-    let prefix_len = prompts.shape()[1];
+    let x = encoder_output["x"].try_extract_array::<f32>()?;
+    let prompts = encoder_output["prompts"].try_extract_array::<i64>()?;
+    let prefix_len = prompts.dim()[1];
 
+    // T2S FS Decoder
     let time = SystemTime::now();
-    let fs_decoder_output = t2s_fs_decoder.run(inputs![
-        "x" => x.view(),
-        "prompts" => prompts.view()
-    ]?)?;
+    let fs_decoder_output = t2s_fs_decoder.run(ort::inputs![
+        "x" => Tensor::from_array(x.to_owned())?,
+        "prompts" => Tensor::from_array(prompts.to_owned())?
+    ])?;
     println!("T2S FS Decoder Cost is {:?}", time.elapsed()?);
     let (mut y, mut k, mut v, mut y_emb, x_example) = (
-        fs_decoder_output["y"].try_extract_tensor::<i64>()?,
-        fs_decoder_output["k"].try_extract_tensor::<f32>()?,
-        fs_decoder_output["v"].try_extract_tensor::<f32>()?,
-        fs_decoder_output["y_emb"].try_extract_tensor::<f32>()?,
-        fs_decoder_output["x_example"].try_extract_tensor::<f32>()?,
+        fs_decoder_output["y"]
+            .try_extract_array::<i64>()?
+            .to_owned(),
+        fs_decoder_output["k"]
+            .try_extract_array::<f32>()?
+            .to_owned(),
+        fs_decoder_output["v"]
+            .try_extract_array::<f32>()?
+            .to_owned(),
+        fs_decoder_output["y_emb"]
+            .try_extract_array::<f32>()?
+            .to_owned(),
+        fs_decoder_output["x_example"]
+            .try_extract_array::<f32>()?
+            .to_owned(),
     );
 
+    // T2S S Decoder
     let time = SystemTime::now();
-    let mut s_decoder_output = t2s_s_decoder.run(inputs![
-        "iy" => y.view(),
-        "ik" => k.view(),
-        "iv" => v.view(),
-        "iy_emb" => y_emb.view(),
-        "ix_example" => x_example.view()
-    ]?)?;
-    println!("T2S S Decoder Cost is {:?}", time.elapsed()?);
     let mut idx = 1;
     let pred_semantic = loop {
-        y = s_decoder_output["y"].try_extract_tensor()?;
-        k = s_decoder_output["k"].try_extract_tensor()?;
-        v = s_decoder_output["v"].try_extract_tensor()?;
-        y_emb = s_decoder_output["y_emb"].try_extract_tensor()?;
-        let samples = s_decoder_output["samples"].try_extract_tensor::<i32>()?;
-        let logits = s_decoder_output["logits"].try_extract_tensor::<f32>()?;
+        let (y_new, k_new, v_new, y_emb_new, samples, logits) = {
+            let time = SystemTime::now();
+
+            // New scope for s_decoder_output
+            let s_decoder_output = t2s_s_decoder.run(ort::inputs![
+                "iy" => Tensor::from_array(y.to_owned())?,
+                "ik" => Tensor::from_array(k.to_owned())?,
+                "iv" => Tensor::from_array(v.to_owned())?,
+                "iy_emb" => Tensor::from_array(y_emb.to_owned())?,
+                "ix_example" => Tensor::from_array(x_example.to_owned())?
+            ])?;
+            println!("T2S S Decoder Forward Once Cost is {:?}", time.elapsed()?);
+
+            (
+                s_decoder_output["y"].try_extract_array::<i64>()?.to_owned(),
+                s_decoder_output["k"].try_extract_array::<f32>()?.to_owned(),
+                s_decoder_output["v"].try_extract_array::<f32>()?.to_owned(),
+                s_decoder_output["y_emb"]
+                    .try_extract_array::<f32>()?
+                    .to_owned(),
+                s_decoder_output["samples"]
+                    .try_extract_array::<i32>()?
+                    .to_owned(),
+                s_decoder_output["logits"]
+                    .try_extract_array::<f32>()?
+                    .to_owned(),
+            )
+        }; // s_decoder_output is dropped here
+        let time = SystemTime::now();
+
+        y = y_new;
+        k = k_new;
+        v = v_new;
+        y_emb = y_emb_new;
+
+        println!("y: {:?}", y.last());
+        println!("y shape: {:?}", y.shape());
+        println!("idx: {:?}", idx);
+
         if idx >= 1500
-            || (y.shape()[1] - prefix_len) > EARLY_STOP_NUM
-            || argmax(&logits).1 == T2S_DECODER_EOS
+            || (y.dim()[1] - prefix_len) > EARLY_STOP_NUM.try_into().unwrap()
+            || argmax(&logits.view()).1 == T2S_DECODER_EOS
             || samples
                 .get((0, 0).into_dimension())
                 .unwrap_or(&(T2S_DECODER_EOS as i32))
                 == &(T2S_DECODER_EOS as i32)
         {
-            let mut y = y.into_owned();
+            let mut y = y.to_owned();
             y.last_mut().and_then(|i| {
                 *i = 0;
                 None::<()>
             });
+
             break y
-                .slice(s![.., y.shape()[1] - idx..])
+                .slice(s![.., y.shape()[1] - idx..; 1])
                 .into_owned()
                 .insert_axis(Axis(0));
         }
 
-        s_decoder_output = t2s_s_decoder.run(inputs![
-            "iy" => y.view(),
-            "ik" => k.view(),
-            "iv" => v.view(),
-            "iy_emb" => y_emb.view(),
-            "ix_example" => x_example.view()
-        ]?)?;
         idx += 1;
+        println!("T2S S Decoder Forward Once Other Cost is {:?}", time.elapsed()?);
     };
 
-    file.seek(SeekFrom::Start(0))?;
-    let ref_audio_32k =
-        UniformSourceIterator::new(Decoder::new(file)?.convert_samples::<f32>(), 1, 32000)
-            .collect::<Vec<f32>>();
-    let ref_audio = Array::from_shape_vec((1, ref_audio_32k.len()), ref_audio_32k)?;
+    println!("T2S S Decoder Cost is {:?}", time.elapsed()?);
 
+    // Read reference audio at 32kHz
+    // Final SoVITS processing
+
+    let ref_audio_32k = resample_audio(audio_samples, spec.sample_rate, 32000)?;
+    let ref_audio = Array::from_shape_vec((1, ref_audio_32k.len()), ref_audio_32k)?;
     let time = SystemTime::now();
-    let outputs = sovits.run(inputs![
-        "text_seq" => text_seq.view(),
-        "pred_semantic" => pred_semantic.view(),
-        "ref_audio" => ref_audio.view()
-    ]?)?;
-    let output = outputs["audio"].try_extract_tensor::<f32>()?;
-    println!("{:?}, {:?}", time.elapsed().unwrap(), output);
-    play_sound(output.as_slice().unwrap());
+    let outputs = sovits.run(ort::inputs![
+        "text_seq" => Tensor::from_array(text_seq.to_owned())?,
+        "pred_semantic" => Tensor::from_array(pred_semantic.to_owned())?,
+        "ref_audio" =>  Tensor::from_array(ref_audio)?
+    ])?;
+    let output = outputs["audio"].try_extract_array::<f32>()?;
+    println!("SoVITS Cost is {:?}", time.elapsed()?);
+
+    // Save output to WAV file
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 32000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create("output.wav", spec)?;
+    for sample in output.as_slice().unwrap() {
+        writer.write_sample(*sample)?;
+    }
+    writer.finalize()?;
+
     Ok(())
 }
 
-fn play_sound(data: &[f32]) {
-    let (_stream, handle) = OutputStream::try_default().unwrap();
-    let player = Sink::try_new(&handle).unwrap();
-    player.append(SamplesBuffer::new(1, 32000, data));
-    player.sleep_until_end()
+// Simple resampling function (linear interpolation)
+fn resample_audio(
+    input: Vec<f32>,
+    in_rate: u32,
+    out_rate: u32,
+) -> Result<Vec<f32>, GptSoVitsError> {
+    if in_rate == out_rate {
+        return Ok(input);
+    }
+
+    let ratio = in_rate as f32 / out_rate as f32;
+    let out_len = ((input.len() as f32 / ratio).ceil() as usize).max(1);
+    let mut output = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let src_idx = i as f32 * ratio;
+        let idx_floor = src_idx.floor() as usize;
+        let frac = src_idx - idx_floor as f32;
+
+        if idx_floor + 1 < input.len() {
+            let sample = input[idx_floor] * (1 as f32 - frac) + input[idx_floor + 1] * frac;
+            output.push(sample);
+        } else if idx_floor < input.len() {
+            output.push(input[idx_floor]);
+        } else {
+            output.push(0.);
+        }
+    }
+
+    Ok(output)
 }
