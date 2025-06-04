@@ -61,6 +61,7 @@ pub fn run<P: AsRef<Path>>(
     ref_text: &str,
     text: &str,
 ) -> Result<(), GptSoVitsError> {
+    type DType = f32;
     // Initialize ONNX sessions
     let mut sovits = Session::builder()?
         .with_execution_providers([CPUExecutionProvider::default().build()])?
@@ -144,16 +145,16 @@ pub fn run<P: AsRef<Path>>(
             .try_extract_array::<i64>()?
             .to_owned(),
         fs_decoder_output["k"]
-            .try_extract_array::<f32>()?
+            .try_extract_array::<DType>()?
             .to_owned(),
         fs_decoder_output["v"]
-            .try_extract_array::<f32>()?
+            .try_extract_array::<DType>()?
             .to_owned(),
         fs_decoder_output["y_emb"]
-            .try_extract_array::<f32>()?
+            .try_extract_array::<DType>()?
             .to_owned(),
         fs_decoder_output["x_example"]
-            .try_extract_array::<f32>()?
+            .try_extract_array::<DType>()?
             .to_owned(),
     );
 
@@ -176,10 +177,10 @@ pub fn run<P: AsRef<Path>>(
 
             (
                 s_decoder_output["y"].try_extract_array::<i64>()?.to_owned(),
-                s_decoder_output["k"].try_extract_array::<f32>()?.to_owned(),
-                s_decoder_output["v"].try_extract_array::<f32>()?.to_owned(),
+                s_decoder_output["k"].try_extract_array::<DType>()?.to_owned(),
+                s_decoder_output["v"].try_extract_array::<DType>()?.to_owned(),
                 s_decoder_output["y_emb"]
-                    .try_extract_array::<f32>()?
+                    .try_extract_array::<DType>()?
                     .to_owned(),
                 s_decoder_output["samples"]
                     .try_extract_array::<i32>()?

@@ -2,7 +2,7 @@ use gpt_sovits::run;
 use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
-    let assets_dir = Path::new("/home/qiang/projects/GPT-SoVITS/onnxsim-onnx/kaoyu");
+    let assets_dir = Path::new("/home/qiang/projects/GPT-SoVITS/onnx-patched/kaoyu");
     run(
         assets_dir.join("kaoyu_vits.onnx"),
         assets_dir.join("kaoyu_ssl.onnx"),

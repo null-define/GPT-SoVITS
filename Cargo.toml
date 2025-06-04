@@ -12,7 +12,13 @@ resolver = "2"
 arpabet = "2.0.0"
 jieba-rs = "0.7.2"
 ndarray = "0.16.1"
-ort = {version = "2.0.0-rc.9", features = ["ndarray","download-binaries","copy-dylibs", "half"]}
+ort = { version = "2.0.0-rc.10", features = [
+    "ndarray",
+    "download-binaries",
+    "copy-dylibs",
+    "half",
+] }
 pinyin = "0.10.0"
 log = "0.4.25"
 hound = "3.5.1"
+half = "2.6.0"
