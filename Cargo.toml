@@ -1,24 +1,21 @@
 [package]
 name = "gpt-sovits"
 version = "0.1.0"
-edition = "2021"
-
-[workspace]
-dependencies.anyhow = "1.0.95"
-members = ["desktop", "mobile"]
-resolver = "2"
+edition = "2024"
 
 [dependencies]
-arpabet = "2.0.0"
-jieba-rs = "0.7.2"
-ndarray = "0.16.1"
 ort = { version = "2.0.0-rc.10", features = [
     "ndarray",
     "download-binaries",
     "copy-dylibs",
     "half",
+    "load-dynamic",
 ] }
+arpabet = "2.0.0"
+jieba-rs = "0.7.2"
+ndarray = "0.16.1"
 pinyin = "0.10.0"
 log = "0.4.25"
 hound = "3.5.1"
 half = "2.6.0"
+anyhow = "1.0.86"

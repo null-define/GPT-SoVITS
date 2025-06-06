@@ -14,6 +14,7 @@ pub enum GptSoVitsError {
     Shape(ShapeError),
     SystemTime(SystemTimeError),
     Hound(HoundError),
+    AnyHow(anyhow::Error),
 }
 
 impl Error for GptSoVitsError {}
@@ -27,6 +28,7 @@ impl Display for GptSoVitsError {
             Self::Shape(e) => Display::fmt(e, f),
             Self::SystemTime(e) => Display::fmt(e, f),
             Self::Hound(e) => Display::fmt(e, f),
+            Self::AnyHow(e) => Display::fmt(e, f),
         }
     }
 }
@@ -58,5 +60,11 @@ impl From<SystemTimeError> for GptSoVitsError {
 impl From<HoundError> for GptSoVitsError {
     fn from(value: HoundError) -> Self {
         Self::Hound(value)
+    }
+}
+
+impl From<anyhow::Error> for GptSoVitsError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::AnyHow(value)
     }
 }

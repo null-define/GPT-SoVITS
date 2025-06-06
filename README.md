@@ -17,7 +17,7 @@
 3. 在armv9设备上优化模型，在保证效果的前提下，使得其具有可以接受的推理延迟 (doing)
     1. 导出onnx fp16模型(done)
     2. 部署到高通骁龙8 elite上并测试性能
-    3. 尝试使用除了onnxruntime之外的后端，比如mnn/ncnn
+    3. 尝试使用除了onnxruntime之外的后端，比如mnn/ncnn(放弃了，没有好用的rust绑定)
 
 当前x86性能请参考 perf.md，不同设备上可能有不同的优化策略
 
